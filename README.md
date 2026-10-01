@@ -1,6 +1,6 @@
 # OpenRouter → Ollama Proxy (GitHub Copilot)
 
-A PowerShell 7 proxy that makes [OpenRouter](https://openrouter.ai) look like a local [Ollama](https://ollama.com) endpoint, enabling GitHub Copilot for Agents (and the VS Code Copilot extension) to use any OpenRouter-hosted model that supports tool calling.
+A PowerShell 5 proxy that makes [OpenRouter](https://openrouter.ai) look like a local [Ollama](https://ollama.com) endpoint, enabling GitHub Copilot for Agents (and the VS Code Copilot extension) to use any OpenRouter-hosted model that supports tool calling.
 
 ## How it works
 
