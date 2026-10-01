@@ -1,14 +1,15 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Proxy that makes OpenRouter look like an Ollama endpoint to GitHub Copilot for Agents.
+    Compatible with Windows PowerShell 5.1 (Desktop edition) and PowerShell 7+.
 
 .DESCRIPTION
     Listens on the same port/paths as Ollama and forwards all requests to OpenRouter.
     Uses a Runspace Pool for concurrency and a shared HttpClient to prevent socket exhaustion.
 
     Visual Studio setup:
-      Tools → Options → GitHub Copilot → Ollama endpoint
+      Tools -> Options -> GitHub Copilot -> Ollama endpoint
       Set to: http://localhost:11434
 
 .PARAMETER ListenPort
@@ -44,10 +45,19 @@ if (-not $OpenRouterApiKey) {
 }
 
 # ---------------------------------------------------------------------------
+# Windows PowerShell 5.1 Compatibility Pre-requisites
+# ---------------------------------------------------------------------------
+# Ensure TLS 1.2 is enabled for REST calls in .NET Framework / PS 5.1
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+# Ensure System.Net.Http assembly is loaded in Windows PowerShell 5.1
+Add-Type -AssemblyName System.Net.Http
+
+# ---------------------------------------------------------------------------
 # Global Shared Resources
 # ---------------------------------------------------------------------------
 # 1. Shared HttpClient (Prevents socket exhaustion)
-$HttpClient = [Net.Http.HttpClient]::new()
+$HttpClient = [System.Net.Http.HttpClient]::new()
 $HttpClient.Timeout = [TimeSpan]::FromMinutes(15)
 
 # 2. Thread-safe Model Cache
@@ -64,7 +74,8 @@ function Log {
     param([string]$Level, [string]$Msg)
     $colors = @{ INFO="Cyan"; WARN="Yellow"; ERROR="Red"; DEBUG="DarkGray" }
     $ts = [DateTime]::Now.ToString("HH:mm:ss.fff")
-    [Console]::ForegroundColor = [ConsoleColor]($colors[$Level] ?? "White")
+    $color = if ($colors.ContainsKey($Level)) { $colors[$Level] } else { "White" }
+    [Console]::ForegroundColor = [ConsoleColor]$color
     [Console]::WriteLine("[$ts][$Level] $Msg")
     [Console]::ResetColor()
 }
@@ -80,7 +91,7 @@ function Send-Json {
         $R.Headers.Add("Access-Control-Allow-Origin","*")
         $R.Headers.Add("Access-Control-Allow-Headers","Content-Type, Authorization")
         $R.Headers.Add("Access-Control-Allow-Methods","GET, POST, OPTIONS")
-        $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         $R.ContentLength64 = $bytes.Length
         $R.OutputStream.Write($bytes, 0, $bytes.Length)
     } finally { try { $R.OutputStream.Close() } catch {} }
@@ -94,20 +105,10 @@ function Send-Err {
 
 function Read-Body {
     param([System.Net.HttpListenerRequest]$Req)
-    if ($Req.ContentLength64 -eq 0) { return "" }
-    if ($Req.ContentLength64 -gt 0) {
-        $buf  = [byte[]]::new($Req.ContentLength64)
-        $read = 0
-        while ($read -lt $buf.Length) {
-            $n = $Req.InputStream.Read($buf, $read, $buf.Length - $read)
-            if ($n -eq 0) { break }
-            $read += $n
-        }
-        return [Text.Encoding]::UTF8.GetString($buf, 0, $read)
-    }
-    $ms = [IO.MemoryStream]::new()
-    $Req.InputStream.CopyTo($ms)
-    return [Text.Encoding]::UTF8.GetString($ms.ToArray())
+    if (-not $Req.HasEntityBody) { return "" }
+    $enc = if ($Req.ContentEncoding) { $Req.ContentEncoding } else { [System.Text.Encoding]::UTF8 }
+    $reader = [System.IO.StreamReader]::new($Req.InputStream, $enc)
+    return $reader.ReadToEnd()
 }
 
 # ---------------------------------------------------------------------------
@@ -120,28 +121,29 @@ function Refresh-Models {
     try {
         if ([DateTime]::Now -lt $ModelCache.Expiry) { return } # Double-check lock
 
-        Log INFO "Fetching tool-calling models from OpenRouter…"
+        Log INFO "Fetching tool-calling models from OpenRouter..."
         $resp = Invoke-RestMethod -Uri "$OpenRouterUrl/models" `
                     -Headers @{ Authorization = "Bearer $OpenRouterApiKey" } `
                     -Method GET
 
-        $ollamaModels = [Collections.Generic.List[string]]::new()
-        $openaiModels = [Collections.Generic.List[string]]::new()
+        $ollamaModels = [System.Collections.Generic.List[string]]::new()
+        $openaiModels = [System.Collections.Generic.List[string]]::new()
         $now          = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.ffffffZ")
         $nowUnix      = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
         foreach ($m in $resp.data) {
             $hasTools = $false
-            if ($m.supported_parameters) {
-                $hasTools = [bool]($m.supported_parameters | Where-Object { $_ -eq "tools" })
+            if ($m.PSObject.Properties['supported_parameters'] -and $m.supported_parameters) {
+                $hasTools = [bool](<$m.supported_parameters | Where-Object { $_ -eq "tools" }>)
             }
             if (-not $hasTools) { continue }
 
-            $id = [string]$m.id
+            $id = if ($m.PSObject.Properties['id']) { [string]$m.id } else { "" }
+            if (-not $id) { continue }
             if ($ModelFilter -and $id -notlike "*$ModelFilter*") { continue }
 
             $family = ($id -split "/")[0]
-            $ctx    = if ($m.context_length) { "$($m.context_length)ctx" } else { "unknown" }
+            $ctx    = if ($m.PSObject.Properties['context_length'] -and $m.context_length) { "$($m.context_length)ctx" } else { "unknown" }
 
             $jId     = $id     -replace '\\','\\\\'  -replace '"','\"'
             $jFamily = $family -replace '\\','\\\\'  -replace '"','\"'
@@ -164,7 +166,8 @@ function Refresh-Models {
         $ModelCache.OpenAIModels = "{`"object`":`"list`",`"data`":[" + ($openaiModels -join ",") + "]}"
         $ModelCache.Expiry       = [DateTime]::Now.AddMinutes(5)
 
-        Log INFO "Cached $($ollamaModels.Count) tool-calling models$(if($ModelFilter){" (filter: *$ModelFilter*)"})"
+        $filterMsg = if ($ModelFilter) { " (filter: *$ModelFilter*)" } else { "" }
+        Log INFO "Cached $($ollamaModels.Count) tool-calling models$filterMsg"
     }
     catch {
         Log WARN "Failed to fetch models: $_"
@@ -184,7 +187,7 @@ function Handle-Chat {
     if (-not $body) { Send-Err $Resp 400 "Empty body"; return }
     if ($DebugOutput) { Log DEBUG "REQ >> $body" }
 
-    $modelMatch  = [regex]::Match($body, '"model"\s*:\s*"([^"]+)"')
+    $modelMatch  = [regex]::Match($body, '"(?:model|name)"\s*:\s*"([^"]+)"')
     $streamMatch = [regex]::Match($body, '"stream"\s*:\s*(true|false)')
     $model    = "openai/gpt-4o"
     if ($modelMatch.Success) { $model = $modelMatch.Groups[1].Value }
@@ -208,7 +211,9 @@ function Handle-Chat {
         }
 
         $promptTok = $null; $completionTok = $null
-        $cts = [Threading.CancellationTokenSource]::new()
+        $cts = [System.Threading.CancellationTokenSource]::new()
+        $reader = $null
+        $upResp = $null
         
         try {
             $Resp.StatusCode  = 200
@@ -218,8 +223,8 @@ function Handle-Chat {
             $Resp.Headers.Add("Connection","keep-alive")
             $Resp.SendChunked = $true
 
-            $reqMsg         = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
-            $reqMsg.Content = [Net.Http.StringContent]::new($outBody, [Text.Encoding]::UTF8, "application/json")
+            $reqMsg         = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
+            $reqMsg.Content = [System.Net.Http.StringContent]::new($outBody, [System.Text.Encoding]::UTF8, "application/json")
             
             # Attach headers directly to the message (Thread-safe for Runspace Pool)
             foreach ($kv in $headers.GetEnumerator()) {
@@ -227,11 +232,11 @@ function Handle-Chat {
             }
 
             # Add 30-second timeout for initial connection
-            $timeoutCts = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
+            $timeoutCts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
             try {
-                $task   = $HttpClient.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $timeoutCts.Token)
-                $delayTask = [Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
-                $completedTask = [Threading.Tasks.Task]::WhenAny($task, $delayTask).GetAwaiter().GetResult()
+                $task   = $HttpClient.SendAsync($reqMsg, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $timeoutCts.Token)
+                $delayTask = [System.Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
+                $completedTask = [System.Threading.Tasks.Task]::WhenAny(@($task, $delayTask)).GetAwaiter().GetResult()
 
                 if ($completedTask -eq $delayTask) {
                     $timeoutCts.Cancel()
@@ -255,8 +260,8 @@ function Handle-Chat {
             }
 
             $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            $reader  = [IO.StreamReader]::new($upBytes)
-            $writer  = [IO.StreamWriter]::new($Resp.OutputStream, [Text.Encoding]::UTF8)
+            $reader  = [System.IO.StreamReader]::new($upBytes)
+            $writer  = [System.IO.StreamWriter]::new($Resp.OutputStream, [System.Text.Encoding]::UTF8)
             $writer.AutoFlush = $true
 
             while (-not $reader.EndOfStream) {
@@ -290,24 +295,27 @@ function Handle-Chat {
             Log ERROR "Stream error: $_"
         }
         finally {
+            if ($null -ne $reader) { try { $reader.Dispose() } catch {} }
+            if ($null -ne $upResp) { try { $upResp.Dispose() } catch {} }
             try { $cts.Dispose() } catch {}
             try { $Resp.OutputStream.Close() } catch {}
         }
     }
     else {
+        $promptTok = $null; $completionTok = $null
         try {
             # Use HttpClient with 30-second timeout for non-streaming requests
-            $reqMsg         = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
-            $reqMsg.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, "application/json")
+            $reqMsg         = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
+            $reqMsg.Content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/json")
             foreach ($kv in $headers.GetEnumerator()) {
                 $reqMsg.Headers.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
             }
 
-            $timeoutCts = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
+            $timeoutCts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
             try {
                 $task = $HttpClient.SendAsync($reqMsg, $timeoutCts.Token)
-                $delayTask = [Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
-                $completedTask = [Threading.Tasks.Task]::WhenAny($task, $delayTask).GetAwaiter().GetResult()
+                $delayTask = [System.Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
+                $completedTask = [System.Threading.Tasks.Task]::WhenAny(@($task, $delayTask)).GetAwaiter().GetResult()
 
                 if ($completedTask -eq $delayTask) {
                     $timeoutCts.Cancel()
@@ -322,37 +330,24 @@ function Handle-Chat {
                 $timeoutCts.Dispose()
             }
 
+            $resBody = $upResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
             # Check if upstream returned an error
             if (-not $upResp.IsSuccessStatusCode) {
-                $errorBody = $upResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                Log ERROR "Upstream error: $($upResp.StatusCode) - $errorBody"
-                Send-Err $Resp ([int]$upResp.StatusCode) $errorBody
+                Log ERROR "Upstream error: $($upResp.StatusCode) - $resBody"
+                Send-Err $Resp ([int]$upResp.StatusCode) $resBody
                 return
             }
 
-            $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            $reader  = [IO.StreamReader]::new($upBytes)
-            $writer  = [IO.StreamWriter]::new($Resp.OutputStream, [Text.Encoding]::UTF8)
-            $writer.AutoFlush = $true
-
-            while (-not $reader.EndOfStream) {
-                # Stop Generating support: Abort if client disconnects
-                if (-not $Resp.OutputStream.CanWrite) {
-                    Log WARN "Client disconnected. Aborting OpenRouter stream."
-                    $cts.Cancel()
-                    break
-                }
-
-                $line = $reader.ReadLine()
-                $writer.WriteLine($line)
-                if ($DebugOutput) { Log DEBUG "<< $line" }
-                
-                if ($line -match '"prompt_tokens"\s*:\s*(\d+)')     { $promptTok     = $Matches[1] }
-                if ($line -match '"completion_tokens"\s*:\s*(\d+)') { $completionTok = $Matches[1] }
-            }
+            if ($DebugOutput) { Log DEBUG "<< $resBody" }
+            
+            if ($resBody -match '"prompt_tokens"\s*:\s*(\d+)')     { $promptTok     = $Matches[1] }
+            if ($resBody -match '"completion_tokens"\s*:\s*(\d+)') { $completionTok = $Matches[1] }
             if ($null -ne $promptTok) {
                 Log INFO "<-- tokens  in=$promptTok  out=$completionTok"
             }
+
+            Send-Json -R $Resp -Code ([int]$upResp.StatusCode) -Body $resBody
         }
         catch [System.OperationCanceledException] {
             Log ERROR "Upstream timeout after 30 seconds"
@@ -391,13 +386,14 @@ function Handle-Request {
     }
 
     switch ($path) {
+        ""                      { Send-Json $resp 200 '{"status":"ok","message":"Ollama is running"}'; return }
         "/api/version"          { Send-Json $resp 200 '{"version":"0.3.0"}'; return }
         "/api/tags"             { Refresh-Models; Send-Json $resp 200 $ModelCache.OllamaTags;   return }
         "/api/ps"               { Send-Json $resp 200 '{"models":[]}'; return }
         "/api/show"             {
             $showBody = Read-Body $req
             $modelId  = ""
-            $m = [regex]::Match($showBody, '"model"\s*:\s*"([^"]+)"')
+            $m = [regex]::Match($showBody, '"(?:model|name)"\s*:\s*"([^"]+)"')
             if ($m.Success) { $modelId = $m.Groups[1].Value }
             
             $jId     = $modelId -replace '\\','\\\\' -replace '"','\"'
@@ -447,19 +443,20 @@ function Handle-Request {
 # Startup & Concurrency Setup
 # ---------------------------------------------------------------------------
 $prefix   = "http://localhost:$ListenPort/"
-$script:listener = [Net.HttpListener]::new()
+$script:listener = [System.Net.HttpListener]::new()
 $script:listener.Prefixes.Add($prefix)
 
 try { $script:listener.Start() }
 catch {
-    Write-Host "ERROR: Cannot bind to $prefix — $_" -ForegroundColor Red
+    Write-Host "ERROR: Cannot bind to $prefix -- $_" -ForegroundColor Red
     Write-Host "Try running as Administrator or change -ListenPort" -ForegroundColor Yellow
     exit 1
 }
 
-# Trap Ctrl+C using a compiled C# class to avoid Runspace threading issues
-try { $null = [CtrlCInterceptor] } catch {
-    Add-Type -TypeDefinition @"
+# Trap Ctrl+C using a compiled C# class to avoid Runspace threading issues.
+# Plain multiline string is used to remain compatible with any line ending (CRLF or LF) in PS 5.1.
+if (-not ('CtrlCInterceptor' -as [type])) {
+    $csharpSource = '
 using System;
 using System.Net;
 public static class CtrlCInterceptor {
@@ -468,12 +465,18 @@ public static class CtrlCInterceptor {
         e.Cancel = true;
         try { if (Listener != null) Listener.Stop(); } catch {}
     }
+    public static void Register() {
+        Console.CancelKeyPress += OnCancelKeyPress;
+    }
+    public static void Unregister() {
+        try { Console.CancelKeyPress -= OnCancelKeyPress; } catch {}
+    }
 }
-"@
+'
+    Add-Type -TypeDefinition $csharpSource
 }
 [CtrlCInterceptor]::Listener = $script:listener
-$cancelEventHandler = [ConsoleCancelEventHandler][CtrlCInterceptor]::OnCancelKeyPress
-[Console]::add_CancelKeyPress($cancelEventHandler)
+[CtrlCInterceptor]::Register()
 
 # Setup Runspace Pool for Concurrency
 $iss = [initialsessionstate]::CreateDefault()
@@ -499,14 +502,14 @@ $runspacePool.Open()
 $jobs = [System.Collections.Generic.List[psobject]]::new()
 
 Write-Host ""
-Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║   GitHub Copilot  →  OpenRouter  (Ollama-shape proxy)     ║" -ForegroundColor Green
-Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "+===========================================================+" -ForegroundColor Green
+Write-Host "|   GitHub Copilot  ->  OpenRouter  (Ollama-shape proxy)     |" -ForegroundColor Green
+Write-Host "+===========================================================+" -ForegroundColor Green
 Write-Host "  Listening  : $prefix"        -ForegroundColor Cyan
 Write-Host "  OpenRouter : $OpenRouterUrl" -ForegroundColor Cyan
 if ($ModelFilter) { Write-Host "  Filter     : *$ModelFilter*" -ForegroundColor Cyan }
 Write-Host ""
-Write-Host "  VS setup: Tools → Options → GitHub Copilot → Ollama endpoint" -ForegroundColor Yellow
+Write-Host "  VS setup: Tools -> Options -> GitHub Copilot -> Ollama endpoint" -ForegroundColor Yellow
 Write-Host "            http://localhost:$ListenPort" -ForegroundColor White
 Write-Host ""
 Write-Host "  Press Ctrl+C to stop." -ForegroundColor DarkGray
@@ -527,11 +530,11 @@ while ($script:listener.IsListening) {
     try {
         $ctx = $script:listener.GetContext()
     }
-    catch [Net.HttpListenerException] {
+    catch [System.Net.HttpListenerException] {
         if (-not $script:listener.IsListening) { break }
         continue
     }
-    catch [ObjectDisposedException] { break }
+    catch [System.ObjectDisposedException] { break }
 
     # Hand off request to Runspace Pool
     $ps = [powershell]::Create()
@@ -548,6 +551,7 @@ while ($script:listener.IsListening) {
 # ---------------------------------------------------------------------------
 # Cleanup on Exit
 # ---------------------------------------------------------------------------
+try { [CtrlCInterceptor]::Unregister() } catch {}
 foreach ($job in $jobs) {
     try { $job.PS.Stop() } catch {}
     try { $job.PS.Dispose() } catch {}
